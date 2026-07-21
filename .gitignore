@@ -10,3 +10,8 @@ __pycache__/
 input.txt
 env/
 venv/
+scratch
+out-*/
+data/*/raw/
+data/*/test_qa.txt
+*.safetensors

@@ -69,16 +69,18 @@ def dct2d(block):
     return _dct_matrix(bh) @ block @ _dct_matrix(bw).T
 
 def image_to_int_sequence(img, quality=50, block_shape=(8, 8), return_blocks=False):
-    """img: 28x28 uint8 array. Returns a flat list of ints (one JPEG-style
-    quantized-DCT sequence, blocks concatenated left-to-right, top-to-bottom,
-    each block truncated after its last non-zero coefficient).
+    """img: HxW uint8 array (H,W <= 32; e.g. 28x28 MNIST or 32x32 CIFAR).
+    Returns a flat list of ints (one JPEG-style quantized-DCT sequence,
+    blocks concatenated left-to-right, top-to-bottom, each block truncated
+    after its last non-zero coefficient).
     If return_blocks, also returns a list of (block_row, block_col, start, end)
     giving each spatial block's [start, end) index range within the flat list."""
     bh, bw = block_shape
     assert 32 % bh == 0 and 32 % bw == 0, "block_shape must evenly divide the 32x32 padded image"
     img = np.asarray(img, dtype=np.float64)
+    h, w = img.shape
     padded = np.zeros((32, 32))
-    padded[:28, :28] = img
+    padded[:h, :w] = img
     padded -= 128.0  # standard JPEG level shift
     qtable = quality_table(quality, block_shape)
     zigzag = _zigzag_order(bh, bw)
@@ -101,6 +103,67 @@ def image_to_int_sequence(img, quality=50, block_shape=(8, 8), return_blocks=Fal
     if return_blocks:
         return seq, block_ranges
     return seq
+
+def image_to_block_string(img, quality=50, block_shape=(8, 8)):
+    """Like image_to_int_sequence, but self-delimiting: '|' separates blocks,
+    ',' separates coefficients within a block. Needed for the generation
+    direction, where the model produces the text itself and we must be able
+    to recover block boundaries from the string alone (block lengths vary
+    per-block due to EOB truncation, so a flat comma-joined list isn't
+    reversible without knowing the true image in advance)."""
+    seq, block_ranges = image_to_int_sequence(img, quality, block_shape, return_blocks=True)
+    parts = []
+    for br, bc, start, end in block_ranges:
+        parts.append(','.join(str(v) for v in seq[start:end]))
+    return '|'.join(parts)
+
+def string_to_blocks(s):
+    """Inverse of image_to_block_string's delimiting: '|'-separated blocks,
+    each a comma-separated list of ints. Tolerant of malformed/truncated
+    generated text (skips unparseable tokens rather than raising)."""
+    blocks = []
+    for part in s.split('|'):
+        vals = []
+        for tok in part.split(','):
+            tok = tok.strip()
+            if tok == '':
+                continue
+            try:
+                vals.append(int(tok))
+            except ValueError:
+                pass
+        blocks.append(vals)
+    return blocks
+
+def blocks_to_image(block_coeffs, quality=50, block_shape=(8, 8), img_shape=(28, 28)):
+    """Inverse of image_to_block_string (+the encode pipeline): dequantize,
+    inverse DCT, undo level shift, reassemble the 32x32 canvas, crop to
+    img_shape (28x28 for MNIST, 32x32 i.e. no crop for CIFAR).
+    block_coeffs: list of per-block coefficient lists (as returned by
+    string_to_blocks), in the same block traversal order as encoding
+    (row-major, top-to-bottom / left-to-right)."""
+    bh, bw = block_shape
+    qtable = quality_table(quality, block_shape)
+    zigzag = _zigzag_order(bh, bw)
+    # forward was A @ block @ B.T (A=dct_matrix(bh), B=dct_matrix(bw)); since A,B are
+    # orthogonal, the inverse is block = A.T @ coeffs @ B (not B.T -- using B.T here
+    # would re-apply a forward transform along that axis instead of inverting it)
+    A, B = _dct_matrix(bh), _dct_matrix(bw)
+    canvas = np.zeros((32, 32))
+    block_idx = 0
+    for by in range(0, 32, bh):
+        for bx in range(0, 32, bw):
+            vals = block_coeffs[block_idx] if block_idx < len(block_coeffs) else []
+            block_idx += 1
+            coeffs = np.zeros((bh, bw))
+            for (r, c), v in zip(zigzag, vals + [0] * (bh * bw - len(vals))):
+                coeffs[r, c] = v
+            dequant = coeffs * qtable
+            pixels = A.T @ dequant @ B + 128.0
+            canvas[by:by + bh, bx:bx + bw] = pixels
+    canvas = np.clip(canvas, 0, 255)
+    h, w = img_shape
+    return canvas[:h, :w].astype(np.uint8)
 
 
 if __name__ == '__main__':
